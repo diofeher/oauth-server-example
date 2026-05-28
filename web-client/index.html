@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>OAuth Demo</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: system-ui, sans-serif; max-width: 480px; margin: 60px auto; padding: 0 20px; color: #1a1a1a; }
+    h1 { font-size: 1.4rem; margin-bottom: 24px; }
+    button { padding: 10px 20px; border: none; border-radius: 6px; cursor: pointer; font-size: 0.95rem; }
+    #signInBtn { background: #0066cc; color: white; }
+    #signOutBtn { background: #cc3333; color: white; display: none; margin-left: 8px; }
+    #userInfoBtn { background: #228833; color: white; display: none; margin-left: 8px; }
+    #status { margin-top: 20px; padding: 12px; background: #f5f5f5; border-radius: 6px; white-space: pre-wrap; font-family: monospace; font-size: 0.85rem; display: none; }
+    .actions { display: flex; gap: 8px; flex-wrap: wrap; }
+  </style>
+</head>
+<body>
+  <h1>OAuth 2.0 PKCE Demo</h1>
+  <div class="actions">
+    <button id="signInBtn" onclick="signIn()">Sign In</button>
+    <button id="signOutBtn" onclick="signOut()">Sign Out</button>
+    <button id="userInfoBtn" onclick="getUserInfo()">Get User Info</button>
+  </div>
+  <div id="status"></div>
+
+  <script>
+    const AUTH_URL = 'http://localhost:8080/authorize';
+    const TOKEN_URL = 'http://localhost:8080/token';
+    const USERINFO_URL = 'http://localhost:8080/userinfo';
+    const CLIENT_ID = 'web-client';
+    const REDIRECT_URI = window.location.origin + window.location.pathname;
+
+    init();
+
+    function init() {
+      const params = new URLSearchParams(window.location.search);
+      const code = params.get('code');
+      const state = params.get('state');
+
+      if (code && state) {
+        window.history.replaceState({}, '', window.location.pathname);
+        handleCallback(code, state);
+        return;
+      }
+
+      if (sessionStorage.getItem('access_token')) {
+        showSignedIn();
+      }
+    }
+
+    async function signIn() {
+      const codeVerifier = generateCodeVerifier();
+      const codeChallenge = await generateCodeChallenge(codeVerifier);
+      const state = generateRandomString(32);
+
+      sessionStorage.setItem('pkce_code_verifier', codeVerifier);
+      sessionStorage.setItem('pkce_state', state);
+
+      const params = new URLSearchParams({
+        client_id: CLIENT_ID,
+        redirect_uri: REDIRECT_URI,
+        response_type: 'code',
+        state: state,
+        code_challenge: codeChallenge,
+        code_challenge_method: 'S256',
+      });
+
+      window.location.href = `${AUTH_URL}?${params}`;
+    }
+
+    async function handleCallback(code, state) {
+      const savedState = sessionStorage.getItem('pkce_state');
+      if (state !== savedState) {
+        showStatus('Error: state mismatch. Possible CSRF attack.');
+        return;
+      }
+
+      const codeVerifier = sessionStorage.getItem('pkce_code_verifier');
+      sessionStorage.removeItem('pkce_state');
+      sessionStorage.removeItem('pkce_code_verifier');
+
+      try {
+        const resp = await fetch(TOKEN_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: new URLSearchParams({
+            grant_type: 'authorization_code',
+            client_id: CLIENT_ID,
+            code: code,
+            redirect_uri: REDIRECT_URI,
+            code_verifier: codeVerifier,
+          }),
+        });
+
+        if (!resp.ok) {
+          const err = await resp.json();
+          throw new Error(err.error_description || err.error);
+        }
+
+        const data = await resp.json();
+        sessionStorage.setItem('access_token', data.access_token);
+        showSignedIn();
+        showStatus(`Signed in successfully.\nToken: ${data.access_token.substring(0, 16)}...`);
+      } catch (e) {
+        showStatus(`Token exchange failed: ${e.message}`);
+      }
+    }
+
+    async function getUserInfo() {
+      const token = sessionStorage.getItem('access_token');
+      if (!token) return;
+
+      try {
+        const resp = await fetch(USERINFO_URL, {
+          headers: { 'Authorization': `Bearer ${token}` },
+        });
+
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+
+        const data = await resp.json();
+        showStatus(`User Info:\n${JSON.stringify(data, null, 2)}`);
+      } catch (e) {
+        showStatus(`Failed: ${e.message}`);
+      }
+    }
+
+    function signOut() {
+      sessionStorage.removeItem('access_token');
+      showSignedOut();
+      showStatus('Signed out.');
+    }
+
+    function showSignedIn() {
+      document.getElementById('signInBtn').style.display = 'none';
+      document.getElementById('signOutBtn').style.display = 'inline-block';
+      document.getElementById('userInfoBtn').style.display = 'inline-block';
+    }
+
+    function showSignedOut() {
+      document.getElementById('signInBtn').style.display = 'inline-block';
+      document.getElementById('signOutBtn').style.display = 'none';
+      document.getElementById('userInfoBtn').style.display = 'none';
+    }
+
+    function showStatus(msg) {
+      const el = document.getElementById('status');
+      el.style.display = 'block';
+      el.textContent = msg;
+    }
+
+    function generateRandomString(length) {
+      const arr = new Uint8Array(length);
+      crypto.getRandomValues(arr);
+      return Array.from(arr, b => b.toString(16).padStart(2, '0')).join('');
+    }
+
+    function generateCodeVerifier() {
+      const arr = new Uint8Array(32);
+      crypto.getRandomValues(arr);
+      return base64UrlEncode(arr);
+    }
+
+    async function generateCodeChallenge(verifier) {
+      const encoded = new TextEncoder().encode(verifier);
+      const digest = await crypto.subtle.digest('SHA-256', encoded);
+      return base64UrlEncode(new Uint8Array(digest));
+    }
+
+    function base64UrlEncode(buffer) {
+      return btoa(String.fromCharCode(...buffer))
+        .replace(/\+/g, '-')
+        .replace(/\//g, '_')
+        .replace(/=+$/, '');
+    }
+  </script>
+</body>
+</html>

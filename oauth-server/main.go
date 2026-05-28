@@ -15,10 +15,12 @@ import (
 	"time"
 )
 
-const (
-	listenAddr = ":8080"
-	clientID   = "vscode-extension"
-)
+const listenAddr = ":8080"
+
+var validClients = map[string]bool{
+	"vscode-extension": true,
+	"web-client":       true,
+}
 
 type AuthCode struct {
 	Code                string
@@ -175,7 +177,7 @@ func handleToken(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cid := r.FormValue("client_id")
-	if cid != clientID {
+	if !validClients[cid] {
 		jsonError(w, "invalid_client", "Unknown client_id", http.StatusBadRequest)
 		return
 	}

@@ -1,6 +1,6 @@
-# OAuth Server + VSCode Extension Example
+# OAuth Server + Clients Example
 
-Minimal OAuth 2.0 Authorization Code with PKCE flow: a Go server and a VSCode extension client.
+Minimal OAuth 2.0 Authorization Code with PKCE flow: a Go server, a web client, and a VSCode extension.
 
 ## Architecture
 
@@ -49,6 +49,9 @@ oauth-server/          Go OAuth 2.0 authorization server
 ├── main.go            Server with /authorize, /token, /userinfo endpoints
 └── go.mod
 
+web-client/            Vanilla HTML/JS SPA (no dependencies)
+└── index.html         Auth Code + PKCE flow in the browser
+
 vscode-extension/      VSCode extension (TypeScript)
 ├── src/
 │   ├── extension.ts       Commands: Sign In, Sign Out, Get User Info
@@ -76,7 +79,16 @@ go run .
 
 Server runs on `http://localhost:8080`.
 
-### 2. Launch the VSCode extension
+### 2. Open the web client
+
+```bash
+cd web-client
+python3 -m http.server 5500
+```
+
+Open `http://localhost:5500` → click **Sign In** → log in with `demo` / `demo` → redirected back with token.
+
+### 3. Launch the VSCode extension
 
 ```bash
 cd vscode-extension
@@ -85,7 +97,7 @@ npm run compile
 code --extensionDevelopmentPath=$(pwd)
 ```
 
-### 3. Authenticate
+### 4. Authenticate (VSCode)
 
 1. Open Command Palette (`Cmd+Shift+P`)
 2. Run **OAuth Demo: Sign In**
