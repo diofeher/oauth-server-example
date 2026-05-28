@@ -9,6 +9,15 @@ const CALLBACK_PORT = 3000;
 const REDIRECT_URI = `http://localhost:${CALLBACK_PORT}/callback`;
 
 const SESSION_KEY = "oauthDemo.session";
+const REFRESH_TOKEN_KEY = "oauthDemo.refreshToken";
+
+interface TokenResponse {
+  access_token: string;
+  token_type: string;
+  expires_in: number;
+  refresh_token?: string;
+  scope?: string;
+}
 
 export class OAuthAuthenticationProvider
   implements vscode.AuthenticationProvider
@@ -33,20 +42,32 @@ export class OAuthAuthenticationProvider
   }
 
   async createSession(
-    _scopes: string[]
+    scopes: string[]
   ): Promise<vscode.AuthenticationSession> {
     const { codeVerifier, codeChallenge } = generatePKCE();
     const state = crypto.randomBytes(16).toString("hex");
+    const scopeString = scopes.length > 0 ? scopes.join(" ") : "openid profile";
 
-    const authCode = await this.promptAuthorization(codeChallenge, state);
+    const authCode = await this.promptAuthorization(
+      codeChallenge,
+      state,
+      scopeString
+    );
 
     const tokenData = await exchangeCodeForToken(authCode, codeVerifier);
+
+    if (tokenData.refresh_token) {
+      await this.context.secrets.store(
+        REFRESH_TOKEN_KEY,
+        tokenData.refresh_token
+      );
+    }
 
     const session: vscode.AuthenticationSession = {
       id: crypto.randomUUID(),
       accessToken: tokenData.access_token,
       account: { id: "demo", label: "demo" },
-      scopes: [],
+      scopes: tokenData.scope ? tokenData.scope.split(" ") : scopes,
     };
 
     this._currentSession = session;
@@ -61,10 +82,48 @@ export class OAuthAuthenticationProvider
     return session;
   }
 
+  async refreshSession(): Promise<vscode.AuthenticationSession | undefined> {
+    const refreshToken = await this.context.secrets.get(REFRESH_TOKEN_KEY);
+    if (!refreshToken) return undefined;
+
+    try {
+      const tokenData = await refreshAccessToken(refreshToken);
+
+      if (tokenData.refresh_token) {
+        await this.context.secrets.store(
+          REFRESH_TOKEN_KEY,
+          tokenData.refresh_token
+        );
+      }
+
+      const session: vscode.AuthenticationSession = {
+        id: crypto.randomUUID(),
+        accessToken: tokenData.access_token,
+        account: { id: "demo", label: "demo" },
+        scopes: tokenData.scope ? tokenData.scope.split(" ") : [],
+      };
+
+      this._currentSession = session;
+      await this.context.secrets.store(SESSION_KEY, JSON.stringify(session));
+
+      this._sessionChangeEmitter.fire({
+        added: [],
+        removed: [],
+        changed: [session],
+      });
+
+      return session;
+    } catch {
+      await this.context.secrets.delete(REFRESH_TOKEN_KEY);
+      return undefined;
+    }
+  }
+
   async removeSession(): Promise<void> {
     const removed = this._currentSession;
     this._currentSession = undefined;
     await this.context.secrets.delete(SESSION_KEY);
+    await this.context.secrets.delete(REFRESH_TOKEN_KEY);
 
     if (removed) {
       this._sessionChangeEmitter.fire({
@@ -77,7 +136,8 @@ export class OAuthAuthenticationProvider
 
   private promptAuthorization(
     codeChallenge: string,
-    state: string
+    state: string,
+    scope: string
   ): Promise<string> {
     return new Promise((resolve, reject) => {
       const server = http.createServer((req, res) => {
@@ -119,6 +179,7 @@ export class OAuthAuthenticationProvider
           client_id: CLIENT_ID,
           redirect_uri: REDIRECT_URI,
           response_type: "code",
+          scope,
           state,
           code_challenge: codeChallenge,
           code_challenge_method: "S256",
@@ -149,7 +210,7 @@ function generatePKCE(): { codeVerifier: string; codeChallenge: string } {
 async function exchangeCodeForToken(
   code: string,
   codeVerifier: string
-): Promise<{ access_token: string; token_type: string; expires_in: number }> {
+): Promise<TokenResponse> {
   const body = new URLSearchParams({
     grant_type: "authorization_code",
     client_id: CLIENT_ID,
@@ -169,9 +230,28 @@ async function exchangeCodeForToken(
     throw new Error(`Token exchange failed: ${err}`);
   }
 
-  return resp.json() as Promise<{
-    access_token: string;
-    token_type: string;
-    expires_in: number;
-  }>;
+  return resp.json() as Promise<TokenResponse>;
+}
+
+async function refreshAccessToken(
+  refreshToken: string
+): Promise<TokenResponse> {
+  const body = new URLSearchParams({
+    grant_type: "refresh_token",
+    client_id: CLIENT_ID,
+    refresh_token: refreshToken,
+  });
+
+  const resp = await fetch(TOKEN_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: body.toString(),
+  });
+
+  if (!resp.ok) {
+    const err = await resp.text();
+    throw new Error(`Token refresh failed: ${err}`);
+  }
+
+  return resp.json() as Promise<TokenResponse>;
 }

@@ -62,6 +62,7 @@
         client_id: CLIENT_ID,
         redirect_uri: REDIRECT_URI,
         response_type: 'code',
+        scope: 'openid profile email',
         state: state,
         code_challenge: codeChallenge,
         code_challenge_method: 'S256',
@@ -101,8 +102,9 @@
 
         const data = await resp.json();
         sessionStorage.setItem('access_token', data.access_token);
+        if (data.refresh_token) sessionStorage.setItem('refresh_token', data.refresh_token);
         showSignedIn();
-        showStatus(`Signed in successfully.\nToken: ${data.access_token.substring(0, 16)}...`);
+        showStatus(`Signed in successfully.\nToken: ${data.access_token.substring(0, 16)}...\nScope: ${data.scope}`);
       } catch (e) {
         showStatus(`Token exchange failed: ${e.message}`);
       }
@@ -117,6 +119,12 @@
           headers: { 'Authorization': `Bearer ${token}` },
         });
 
+        if (resp.status === 401) {
+          const refreshed = await refreshAccessToken();
+          if (refreshed) return getUserInfo();
+          showStatus('Session expired. Please sign in again.');
+          return;
+        }
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
 
         const data = await resp.json();
@@ -126,8 +134,35 @@
       }
     }
 
+    async function refreshAccessToken() {
+      const refreshToken = sessionStorage.getItem('refresh_token');
+      if (!refreshToken) return false;
+
+      try {
+        const resp = await fetch(TOKEN_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: new URLSearchParams({
+            grant_type: 'refresh_token',
+            client_id: CLIENT_ID,
+            refresh_token: refreshToken,
+          }),
+        });
+
+        if (!resp.ok) return false;
+
+        const data = await resp.json();
+        sessionStorage.setItem('access_token', data.access_token);
+        if (data.refresh_token) sessionStorage.setItem('refresh_token', data.refresh_token);
+        return true;
+      } catch {
+        return false;
+      }
+    }
+
     function signOut() {
       sessionStorage.removeItem('access_token');
+      sessionStorage.removeItem('refresh_token');
       window.location.href = `http://localhost:8080/logout?redirect_uri=${encodeURIComponent(REDIRECT_URI)}`;
     }
 

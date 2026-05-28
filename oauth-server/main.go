@@ -10,6 +10,7 @@ import (
 	"html/template"
 	"log"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -17,10 +18,28 @@ import (
 
 const listenAddr = ":8080"
 
-var validClients = map[string]bool{
-	"vscode-extension": true,
-	"web-client":       true,
-	"workspace":        true,
+type Client struct {
+	ID           string
+	RedirectURIs []string
+	Scopes       []string
+}
+
+var registeredClients = map[string]*Client{
+	"vscode-extension": {
+		ID:           "vscode-extension",
+		RedirectURIs: []string{"http://localhost:3000/callback"},
+		Scopes:       []string{"openid", "profile"},
+	},
+	"web-client": {
+		ID:           "web-client",
+		RedirectURIs: []string{"http://localhost:5500/"},
+		Scopes:       []string{"openid", "profile", "email"},
+	},
+	"workspace": {
+		ID:           "workspace",
+		RedirectURIs: []string{"http://localhost:5501/"},
+		Scopes:       []string{"openid", "profile"},
+	},
 }
 
 type AuthCode struct {
@@ -29,13 +48,24 @@ type AuthCode struct {
 	CodeChallengeMethod string
 	RedirectURI         string
 	UserID              string
+	Scopes              []string
 	ExpiresAt           time.Time
 }
 
 type Token struct {
-	AccessToken string
-	UserID      string
-	ExpiresAt   time.Time
+	AccessToken  string
+	RefreshToken string
+	UserID       string
+	Scopes       []string
+	ExpiresAt    time.Time
+}
+
+type RefreshToken struct {
+	Token     string
+	UserID    string
+	ClientID  string
+	Scopes    []string
+	ExpiresAt time.Time
 }
 
 type Session struct {
@@ -45,17 +75,19 @@ type Session struct {
 }
 
 type Store struct {
-	mu       sync.RWMutex
-	codes    map[string]*AuthCode
-	tokens   map[string]*Token
-	sessions map[string]*Session
+	mu            sync.RWMutex
+	codes         map[string]*AuthCode
+	tokens        map[string]*Token
+	refreshTokens map[string]*RefreshToken
+	sessions      map[string]*Session
 }
 
 func NewStore() *Store {
 	return &Store{
-		codes:    make(map[string]*AuthCode),
-		tokens:   make(map[string]*Token),
-		sessions: make(map[string]*Session),
+		codes:         make(map[string]*AuthCode),
+		tokens:        make(map[string]*Token),
+		refreshTokens: make(map[string]*RefreshToken),
+		sessions:      make(map[string]*Session),
 	}
 }
 
@@ -65,7 +97,7 @@ func (s *Store) SaveCode(ac *AuthCode) {
 	s.codes[ac.Code] = ac
 }
 
-func (s *Store) GetCode(code string) *AuthCode {
+func (s *Store) ConsumeCode(code string) *AuthCode {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	ac, ok := s.codes[code]
@@ -86,6 +118,23 @@ func (s *Store) GetToken(accessToken string) *Token {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.tokens[accessToken]
+}
+
+func (s *Store) SaveRefreshToken(rt *RefreshToken) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.refreshTokens[rt.Token] = rt
+}
+
+func (s *Store) ConsumeRefreshToken(token string) *RefreshToken {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rt, ok := s.refreshTokens[token]
+	if !ok {
+		return nil
+	}
+	delete(s.refreshTokens, token)
+	return rt
 }
 
 func (s *Store) SaveSession(sess *Session) {
@@ -121,6 +170,41 @@ func verifyPKCE(codeVerifier, codeChallenge, method string) bool {
 	return computed == codeChallenge
 }
 
+func getClient(clientID string) *Client {
+	return registeredClients[clientID]
+}
+
+func (c *Client) ValidateRedirectURI(uri string) bool {
+	return slices.Contains(c.RedirectURIs, uri)
+}
+
+func (c *Client) ValidateScopes(requested []string) ([]string, bool) {
+	if len(requested) == 0 {
+		return c.Scopes, true
+	}
+	allowed := make(map[string]bool, len(c.Scopes))
+	for _, s := range c.Scopes {
+		allowed[s] = true
+	}
+	for _, s := range requested {
+		if !allowed[s] {
+			return nil, false
+		}
+	}
+	return requested, true
+}
+
+func parseScopes(s string) []string {
+	if s == "" {
+		return nil
+	}
+	return strings.Fields(s)
+}
+
+func joinScopes(scopes []string) string {
+	return strings.Join(scopes, " ")
+}
+
 func getSessionUser(r *http.Request) string {
 	cookie, err := r.Cookie("session_id")
 	if err != nil {
@@ -150,7 +234,36 @@ func setSessionCookie(w http.ResponseWriter, userID string) {
 	})
 }
 
-func issueCodeAndRedirect(w http.ResponseWriter, r *http.Request, userID, redirectURI, state, codeChallenge, codeChallengeMethod string) {
+func issueTokenPair(userID, clientID string, scopes []string) map[string]any {
+	accessToken := randomString(32)
+	refreshToken := randomString(32)
+
+	store.SaveToken(&Token{
+		AccessToken:  accessToken,
+		RefreshToken: refreshToken,
+		UserID:       userID,
+		Scopes:       scopes,
+		ExpiresAt:    time.Now().Add(1 * time.Hour),
+	})
+
+	store.SaveRefreshToken(&RefreshToken{
+		Token:     refreshToken,
+		UserID:    userID,
+		ClientID:  clientID,
+		Scopes:    scopes,
+		ExpiresAt: time.Now().Add(30 * 24 * time.Hour),
+	})
+
+	return map[string]any{
+		"access_token":  accessToken,
+		"token_type":    "Bearer",
+		"expires_in":    3600,
+		"refresh_token": refreshToken,
+		"scope":         joinScopes(scopes),
+	}
+}
+
+func issueCodeAndRedirect(w http.ResponseWriter, r *http.Request, userID, redirectURI, state, codeChallenge, codeChallengeMethod string, scopes []string) {
 	code := randomString(32)
 	store.SaveCode(&AuthCode{
 		Code:                code,
@@ -158,6 +271,7 @@ func issueCodeAndRedirect(w http.ResponseWriter, r *http.Request, userID, redire
 		CodeChallengeMethod: codeChallengeMethod,
 		RedirectURI:         redirectURI,
 		UserID:              userID,
+		Scopes:              scopes,
 		ExpiresAt:           time.Now().Add(10 * time.Minute),
 	})
 
@@ -181,6 +295,7 @@ button { background: #0066cc; color: white; border: none; cursor: pointer; borde
   <input type="hidden" name="client_id" value="{{.ClientID}}">
   <input type="hidden" name="redirect_uri" value="{{.RedirectURI}}">
   <input type="hidden" name="state" value="{{.State}}">
+  <input type="hidden" name="scope" value="{{.Scope}}">
   <input type="hidden" name="code_challenge" value="{{.CodeChallenge}}">
   <input type="hidden" name="code_challenge_method" value="{{.CodeChallengeMethod}}">
   <label>Username</label>
@@ -209,18 +324,52 @@ func handleAuthorize(w http.ResponseWriter, r *http.Request) {
 		clientID := r.URL.Query().Get("client_id")
 		redirectURI := r.URL.Query().Get("redirect_uri")
 		state := r.URL.Query().Get("state")
+		scope := r.URL.Query().Get("scope")
 		codeChallenge := r.URL.Query().Get("code_challenge")
 		codeChallengeMethod := r.URL.Query().Get("code_challenge_method")
 
-		// SSO: if user has valid session, skip login and auto-issue code
-		if userID := getSessionUser(r); userID != "" && clientID != "" && redirectURI != "" {
-			issueCodeAndRedirect(w, r, userID, redirectURI, state, codeChallenge, codeChallengeMethod)
+		// No OAuth params — show dashboard if logged in
+		if clientID == "" {
+			if userID := getSessionUser(r); userID != "" {
+				dashboardTmpl.Execute(w, map[string]string{"UserID": userID})
+				return
+			}
+			loginTmpl.Execute(w, map[string]string{})
 			return
 		}
 
-		// No OAuth params — show dashboard if logged in
-		if userID := getSessionUser(r); userID != "" && clientID == "" {
-			dashboardTmpl.Execute(w, map[string]string{"UserID": userID})
+		responseType := r.URL.Query().Get("response_type")
+		if responseType != "code" {
+			jsonError(w, "unsupported_response_type", "Only response_type=code is supported", http.StatusBadRequest)
+			return
+		}
+
+		client := getClient(clientID)
+		if client == nil {
+			jsonError(w, "invalid_client", "Unknown client_id", http.StatusBadRequest)
+			return
+		}
+
+		if !client.ValidateRedirectURI(redirectURI) {
+			jsonError(w, "invalid_request", "redirect_uri not registered for this client", http.StatusBadRequest)
+			return
+		}
+
+		requestedScopes := parseScopes(scope)
+		grantedScopes, ok := client.ValidateScopes(requestedScopes)
+		if !ok {
+			jsonError(w, "invalid_scope", "Requested scope exceeds client allowlist", http.StatusBadRequest)
+			return
+		}
+
+		if codeChallengeMethod != "S256" {
+			jsonError(w, "invalid_request", "code_challenge_method must be S256", http.StatusBadRequest)
+			return
+		}
+
+		// SSO: if user has valid session, skip login and auto-issue code
+		if userID := getSessionUser(r); userID != "" {
+			issueCodeAndRedirect(w, r, userID, redirectURI, state, codeChallenge, codeChallengeMethod, grantedScopes)
 			return
 		}
 
@@ -228,6 +377,7 @@ func handleAuthorize(w http.ResponseWriter, r *http.Request) {
 			"ClientID":            clientID,
 			"RedirectURI":         redirectURI,
 			"State":               state,
+			"Scope":               joinScopes(grantedScopes),
 			"CodeChallenge":       codeChallenge,
 			"CodeChallengeMethod": codeChallengeMethod,
 		}
@@ -257,8 +407,10 @@ func handleAuthorize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	scopes := parseScopes(r.FormValue("scope"))
+
 	issueCodeAndRedirect(w, r, username, redirectURI, state,
-		r.FormValue("code_challenge"), r.FormValue("code_challenge_method"))
+		r.FormValue("code_challenge"), r.FormValue("code_challenge_method"), scopes)
 }
 
 func handleToken(w http.ResponseWriter, r *http.Request) {
@@ -273,19 +425,27 @@ func handleToken(w http.ResponseWriter, r *http.Request) {
 	}
 
 	grantType := r.FormValue("grant_type")
-	if grantType != "authorization_code" {
-		jsonError(w, "unsupported_grant_type", "Only authorization_code supported", http.StatusBadRequest)
-		return
-	}
+	clientID := r.FormValue("client_id")
 
-	cid := r.FormValue("client_id")
-	if !validClients[cid] {
+	client := getClient(clientID)
+	if client == nil {
 		jsonError(w, "invalid_client", "Unknown client_id", http.StatusBadRequest)
 		return
 	}
 
+	switch grantType {
+	case "authorization_code":
+		handleAuthCodeGrant(w, r, client)
+	case "refresh_token":
+		handleRefreshTokenGrant(w, r, client)
+	default:
+		jsonError(w, "unsupported_grant_type", "Supported: authorization_code, refresh_token", http.StatusBadRequest)
+	}
+}
+
+func handleAuthCodeGrant(w http.ResponseWriter, r *http.Request, client *Client) {
 	code := r.FormValue("code")
-	ac := store.GetCode(code)
+	ac := store.ConsumeCode(code)
 	if ac == nil || time.Now().After(ac.ExpiresAt) {
 		jsonError(w, "invalid_grant", "Invalid or expired code", http.StatusBadRequest)
 		return
@@ -302,19 +462,32 @@ func handleToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	accessToken := randomString(32)
-	store.SaveToken(&Token{
-		AccessToken: accessToken,
-		UserID:      ac.UserID,
-		ExpiresAt:   time.Now().Add(1 * time.Hour),
-	})
+	tokenResp := issueTokenPair(ac.UserID, client.ID, ac.Scopes)
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{
-		"access_token": accessToken,
-		"token_type":   "Bearer",
-		"expires_in":   3600,
-	})
+	w.Header().Set("Cache-Control", "no-store")
+	json.NewEncoder(w).Encode(tokenResp)
+}
+
+func handleRefreshTokenGrant(w http.ResponseWriter, r *http.Request, client *Client) {
+	rtValue := r.FormValue("refresh_token")
+	rt := store.ConsumeRefreshToken(rtValue)
+	if rt == nil || time.Now().After(rt.ExpiresAt) {
+		jsonError(w, "invalid_grant", "Invalid or expired refresh token", http.StatusBadRequest)
+		return
+	}
+
+	if rt.ClientID != client.ID {
+		jsonError(w, "invalid_grant", "Refresh token was not issued to this client", http.StatusBadRequest)
+		return
+	}
+
+	// Rotation: old refresh token consumed, new pair issued
+	tokenResp := issueTokenPair(rt.UserID, client.ID, rt.Scopes)
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	json.NewEncoder(w).Encode(tokenResp)
 }
 
 func handleUserInfo(w http.ResponseWriter, r *http.Request) {
@@ -330,11 +503,42 @@ func handleUserInfo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	scopeSet := make(map[string]bool, len(token.Scopes))
+	for _, s := range token.Scopes {
+		scopeSet[s] = true
+	}
+
+	resp := map[string]string{"sub": token.UserID}
+	if scopeSet["profile"] {
+		resp["name"] = token.UserID
+	}
+	if scopeSet["email"] {
+		resp["email"] = token.UserID + "@example.com"
+	}
+
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{
-		"sub":  token.UserID,
-		"name": token.UserID,
-	})
+	json.NewEncoder(w).Encode(resp)
+}
+
+func handleDiscovery(w http.ResponseWriter, _ *http.Request) {
+	baseURL := fmt.Sprintf("http://localhost%s", listenAddr)
+
+	discovery := map[string]any{
+		"issuer":                 baseURL,
+		"authorization_endpoint": baseURL + "/authorize",
+		"token_endpoint":         baseURL + "/token",
+		"userinfo_endpoint":      baseURL + "/userinfo",
+		"end_session_endpoint":   baseURL + "/logout",
+		"response_types_supported":             []string{"code"},
+		"grant_types_supported":                []string{"authorization_code", "refresh_token"},
+		"scopes_supported":                     []string{"openid", "profile", "email"},
+		"code_challenge_methods_supported":     []string{"S256"},
+		"token_endpoint_auth_methods_supported": []string{"none"},
+		"subject_types_supported":              []string{"public"},
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(discovery)
 }
 
 func jsonError(w http.ResponseWriter, errCode, desc string, status int) {
@@ -381,12 +585,14 @@ func main() {
 	mux.HandleFunc("/token", handleToken)
 	mux.HandleFunc("/userinfo", handleUserInfo)
 	mux.HandleFunc("/logout", handleLogout)
+	mux.HandleFunc("/.well-known/openid-configuration", handleDiscovery)
 
 	fmt.Printf("OAuth server running on http://localhost%s\n", listenAddr)
 	fmt.Println("Endpoints:")
-	fmt.Println("  GET  /authorize  — authorization + SSO endpoint")
-	fmt.Println("  POST /token      — token endpoint")
-	fmt.Println("  GET  /userinfo   — protected resource")
-	fmt.Println("  GET  /logout     — clear session + redirect")
+	fmt.Println("  GET  /authorize                       — authorization + SSO")
+	fmt.Println("  POST /token                           — token (auth_code + refresh_token)")
+	fmt.Println("  GET  /userinfo                        — protected resource (scope-filtered)")
+	fmt.Println("  GET  /logout                          — clear session + redirect")
+	fmt.Println("  GET  /.well-known/openid-configuration — discovery document")
 	log.Fatal(http.ListenAndServe(listenAddr, corsMiddleware(mux)))
 }
