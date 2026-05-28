@@ -6,286 +6,168 @@ Minimal OAuth 2.0 Authorization Code with PKCE flow: a Go server, a web client, 
 
 ### System Overview
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                        OAuth Server (:8080)                        │
-│                                                                     │
-│  ┌─────────────┐  ┌──────────┐  ┌──────────┐  ┌────────────────┐  │
-│  │  /authorize  │  │  /token  │  │ /userinfo │  │ /.well-known/  │  │
-│  │  (login+SSO) │  │ (code+  │  │ (scoped)  │  │  openid-config │  │
-│  │             │  │ refresh) │  │           │  │  (discovery)   │  │
-│  └──────┬──────┘  └────┬─────┘  └─────┬─────┘  └───────┬────────┘  │
-│         │              │              │                 │           │
-│  ┌──────┴──────────────┴──────────────┴─────────────────┴────────┐  │
-│  │                     In-Memory Store                           │  │
-│  │  sessions[] ─ codes[] ─ tokens[] ─ refreshTokens[]            │  │
-│  └───────────────────────────────────────────────────────────────┘  │
-│                                                                     │
-│  ┌───────────────────────────────────────────────────────────────┐  │
-│  │                   Client Registry                             │  │
-│  │                                                               │  │
-│  │  ┌──────────────────┐ ┌────────────┐ ┌─────────────────────┐ │  │
-│  │  │ vscode-extension │ │ web-client │ │     workspace       │ │  │
-│  │  │ redirect: :3000  │ │ redirect:  │ │ redirect: :5501/    │ │  │
-│  │  │ scopes: openid   │ │   :5500/   │ │ scopes: openid      │ │  │
-│  │  │   profile        │ │ scopes:    │ │   profile           │ │  │
-│  │  │                  │ │   openid   │ │                     │ │  │
-│  │  │                  │ │   profile  │ │                     │ │  │
-│  │  │                  │ │   email    │ │                     │ │  │
-│  │  └──────────────────┘ └────────────┘ └─────────────────────┘ │  │
-│  └───────────────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────────────┘
-         │                       │                      │
-         ▼                       ▼                      ▼
-┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐
-│  VSCode Extension│  │    Web Client    │  │    Workspace     │
-│  (localhost:3000)│  │  (localhost:5500)│  │  (localhost:5501)│
-│                  │  │                  │  │                  │
-│  Token: secret   │  │  Token: session  │  │  Token: session  │
-│    storage       │  │    Storage       │  │    Storage       │
-│  Refresh: secret │  │  Refresh: session│  │  Refresh: session│
-│    storage       │  │    Storage       │  │    Storage       │
-└──────────────────┘  └──────────────────┘  └──────────────────┘
+```mermaid
+graph TB
+    subgraph server["OAuth Server (:8080)"]
+        authorize["/authorize<br/>(login+SSO)"]
+        token["/token<br/>(code+refresh)"]
+        userinfo["/userinfo<br/>(scoped)"]
+        discovery["/.well-known/<br/>openid-config<br/>(discovery)"]
+
+        subgraph store["In-Memory Store"]
+            data["sessions[] — codes[] — tokens[] — refreshTokens[]"]
+        end
+
+        subgraph registry["Client Registry"]
+            vscode["vscode-extension<br/>redirect: :3000<br/>scopes: openid profile"]
+            webclient["web-client<br/>redirect: :5500/<br/>scopes: openid profile email"]
+            workspace["workspace<br/>redirect: :5501/<br/>scopes: openid profile"]
+        end
+
+        authorize & token & userinfo & discovery --> store
+    end
+
+    server --> ext["VSCode Extension<br/>(localhost:3000)<br/>Token: secret storage<br/>Refresh: secret storage"]
+    server --> web["Web Client<br/>(localhost:5500)<br/>Token: sessionStorage<br/>Refresh: sessionStorage"]
+    server --> ws["Workspace<br/>(localhost:5501)<br/>Token: sessionStorage<br/>Refresh: sessionStorage"]
 ```
 
 ### Direct Login Flow (web-client, VSCode extension)
 
-```
-┌──────────────┐              ┌──────────┐              ┌──────────────┐
-│    Client     │              │ Browser  │              │ OAuth Server │
-└──────┬───────┘              └────┬─────┘              └──────┬───────┘
-       │                          │                            │
-       │  1. Generate PKCE pair   │                            │
-       │     + random state       │                            │
-       │                          │                            │
-       │  2. Redirect ────────────┼──► GET /authorize          │
-       │     ?client_id=...       │     ?response_type=code    │
-       │     &scope=openid+profile│     &code_challenge=...    │
-       │     &state=...           │     &redirect_uri=...      │
-       │                          │                            │
-       │                          │          ┌─────────────────┤
-       │                          │          │ Validate:       │
-       │                          │          │ • client_id     │
-       │                          │          │ • redirect_uri  │
-       │                          │          │   vs allowlist  │
-       │                          │          │ • scopes vs     │
-       │                          │          │   client config │
-       │                          │          │ • code_challenge│
-       │                          │          │   _method=S256  │
-       │                          │          └─────────────────┤
-       │                          │                            │
-       │                          │  3. Show login form ◄──────│
-       │                          │                            │
-       │                          │  4. POST credentials ─────►│
-       │                          │                            │
-       │                          │          ┌─────────────────┤
-       │                          │          │ Set session     │
-       │                          │          │ cookie (HttpOnly│
-       │                          │          │ SameSite=Lax)   │
-       │                          │          └─────────────────┤
-       │                          │                            │
-       │                          │  5. 302 redirect ◄─────────│
-       │                          │     ?code=...&state=...    │
-       │                          │                            │
-       │  6. Capture code ◄───────┤                            │
-       │     Verify state match   │                            │
-       │                          │                            │
-       │  7. POST /token ─────────────────────────────────────►│
-       │     grant_type=authorization_code                     │
-       │     code=... & code_verifier=...                      │
-       │                          │                            │
-       │                          │          ┌─────────────────┤
-       │                          │          │ Verify:         │
-       │                          │          │ • code validity │
-       │                          │          │ • redirect_uri  │
-       │                          │          │ • PKCE S256     │
-       │                          │          │   (SHA256 of    │
-       │                          │          │   verifier ==   │
-       │                          │          │   challenge)    │
-       │                          │          └─────────────────┤
-       │                          │                            │
-       │  8. Token response ◄──────────────────────────────────│
-       │     { access_token,      │                            │
-       │       refresh_token,     │                            │
-       │       scope, expires_in }│                            │
-       │                          │                            │
-       │  9. GET /userinfo ────────────────────────────────────►
-       │     Authorization: Bearer <token>                     │
-       │                          │                            │
-       │                          │          ┌─────────────────┤
-       │                          │          │ Filter response │
-       │                          │          │ by token scopes:│
-       │                          │          │ profile → name  │
-       │                          │          │ email → email   │
-       │                          │          └─────────────────┤
-       │                          │                            │
-       │  10. User data ◄──────────────────────────────────────│
-       └──────────────────────────┴────────────────────────────┘
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant B as Browser
+    participant S as OAuth Server
+
+    C->>C: 1. Generate PKCE pair + random state
+
+    C->>B: 2. Redirect
+    B->>S: GET /authorize?client_id=...&response_type=code<br/>&scope=openid+profile&code_challenge=...&state=...
+
+    Note right of S: Validate:<br/>• client_id<br/>• redirect_uri vs allowlist<br/>• scopes vs client config<br/>• code_challenge_method=S256
+
+    S->>B: 3. Show login form
+    B->>S: 4. POST credentials
+
+    Note right of S: Set session cookie<br/>(HttpOnly, SameSite=Lax)
+
+    S->>B: 5. 302 redirect ?code=...&state=...
+    B->>C: 6. Capture code, verify state match
+
+    C->>S: 7. POST /token grant_type=authorization_code<br/>code=... & code_verifier=...
+
+    Note right of S: Verify:<br/>• code validity<br/>• redirect_uri<br/>• PKCE S256 (SHA256 of<br/>verifier == challenge)
+
+    S->>C: 8. Token response {access_token,<br/>refresh_token, scope, expires_in}
+
+    C->>S: 9. GET /userinfo Authorization: Bearer token
+
+    Note right of S: Filter response by token scopes:<br/>profile → name, email → email
+
+    S->>C: 10. User data
 ```
 
 ### SSO Flow (workspace, launched from oauth-server dashboard)
 
-```
-┌──────────────┐              ┌──────────┐              ┌──────────────┐
-│  Workspace   │              │ Browser  │              │ OAuth Server │
-│  (:5501)     │              │ (has     │              │  (:8080)     │
-│              │              │ session  │              │              │
-│              │              │ cookie)  │              │              │
-└──────┬───────┘              └────┬─────┘              └──────┬───────┘
-       │                          │                            │
-       │  1. No token →           │                            │
-       │     generate PKCE        │                            │
-       │                          │                            │
-       │  2. Redirect ────────────┼──► GET /authorize          │
-       │     + PKCE + scope       │     + session cookie       │
-       │                          │                            │
-       │                          │          ┌─────────────────┤
-       │                          │          │ Session cookie   │
-       │                          │          │ valid → SKIP     │
-       │                          │          │ login form       │
-       │                          │          │                  │
-       │                          │          │ Auto-issue code  │
-       │                          │          └─────────────────┤
-       │                          │                            │
-       │                          │  3. 302 redirect ◄─────────│
-       │                          │     ?code=...&state=...    │
-       │                          │                            │
-       │  4. Exchange code ────────────────────────────────────►
-       │     for token (PKCE)     │                            │
-       │                          │                            │
-       │  5. { access_token,  ◄────────────────────────────────│
-       │       refresh_token }    │                            │
-       │                          │                            │
-       │  ✓ Authenticated         │                            │
-       │    (zero user clicks)    │                            │
-       └──────────────────────────┴────────────────────────────┘
+```mermaid
+sequenceDiagram
+    participant W as Workspace (:5501)
+    participant B as Browser (has session cookie)
+    participant S as OAuth Server (:8080)
+
+    W->>W: 1. No token → generate PKCE
+
+    W->>B: 2. Redirect + PKCE + scope
+    B->>S: GET /authorize + session cookie
+
+    Note right of S: Session cookie valid →<br/>SKIP login form<br/>Auto-issue code
+
+    S->>B: 3. 302 redirect ?code=...&state=...
+    B->>W: Redirect back
+
+    W->>S: 4. Exchange code for token (PKCE)
+    S->>W: 5. {access_token, refresh_token}
+
+    Note over W: ✓ Authenticated<br/>(zero user clicks)
 ```
 
 ### Refresh Token Flow (all clients)
 
-```
-┌──────────────┐                                ┌──────────────┐
-│    Client     │                                │ OAuth Server │
-└──────┬───────┘                                └──────┬───────┘
-       │                                               │
-       │  1. API call with access_token ──────────────►│
-       │                                               │
-       │  2. 401 Unauthorized ◄────────────────────────│
-       │     (token expired)                           │
-       │                                               │
-       │  3. POST /token ─────────────────────────────►│
-       │     grant_type=refresh_token                  │
-       │     client_id=...                             │
-       │     refresh_token=<old_refresh_token>         │
-       │                                               │
-       │                             ┌─────────────────┤
-       │                             │ Token rotation:  │
-       │                             │ • Consume old    │
-       │                             │   refresh token  │
-       │                             │ • Issue NEW      │
-       │                             │   access token   │
-       │                             │ • Issue NEW      │
-       │                             │   refresh token  │
-       │                             │ (old one is now  │
-       │                             │  invalid)        │
-       │                             └─────────────────┤
-       │                                               │
-       │  4. New token pair ◄──────────────────────────│
-       │     { access_token,                           │
-       │       refresh_token,                          │
-       │       scope, expires_in }                     │
-       │                                               │
-       │  5. Retry original API call ─────────────────►│
-       │     with new access_token                     │
-       └───────────────────────────────────────────────┘
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant S as OAuth Server
 
-  Token lifetimes:
-  ┌─────────────────┬──────────┐
-  │ access_token    │ 1 hour   │
-  │ refresh_token   │ 30 days  │
-  │ auth_code       │ 10 min   │
-  │ session cookie  │ 24 hours │
-  └─────────────────┴──────────┘
+    C->>S: 1. API call with access_token
+    S->>C: 2. 401 Unauthorized (token expired)
+
+    C->>S: 3. POST /token grant_type=refresh_token<br/>client_id=... refresh_token=old_refresh_token
+
+    Note right of S: Token rotation:<br/>• Consume old refresh token<br/>• Issue NEW access token<br/>• Issue NEW refresh token<br/>(old one is now invalid)
+
+    S->>C: 4. New token pair {access_token,<br/>refresh_token, scope, expires_in}
+
+    C->>S: 5. Retry original API call<br/>with new access_token
 ```
+
+Token lifetimes:
+
+| Token | Lifetime |
+|-------|----------|
+| access_token | 1 hour |
+| refresh_token | 30 days |
+| auth_code | 10 min |
+| session cookie | 24 hours |
 
 ### Scope Validation Flow
 
-```
-                        Request: scope=openid profile email
-                                     │
-                                     ▼
-                    ┌────────────────────────────────┐
-                    │     Client Registry Lookup     │
-                    │     client_id = "web-client"   │
-                    └───────────────┬────────────────┘
-                                    │
-                                    ▼
-                    ┌────────────────────────────────┐
-                    │   Allowed: openid profile email │──── ✓ all match
-                    └───────────────┬────────────────┘
-                                    │
-                           Scopes granted:
-                        openid, profile, email
-                                    │
-                         ┌──────────┴──────────┐
-                         ▼                     ▼
-               ┌──────────────────┐  ┌──────────────────┐
-               │  Token issued    │  │  /userinfo        │
-               │  with scopes    │  │  response filtered│
-               │  embedded       │  │  by token scopes  │
-               └──────────────────┘  └──────────────────┘
-                                              │
-                              ┌────────────────┼────────────────┐
-                              ▼                ▼                ▼
-                        ┌──────────┐    ┌──────────┐    ┌──────────┐
-                        │ openid   │    │ profile  │    │  email   │
-                        │ → sub    │    │ → name   │    │ → email  │
-                        └──────────┘    └──────────┘    └──────────┘
+```mermaid
+flowchart TD
+    A["Request: scope=openid profile email"] --> B["Client Registry Lookup<br/>client_id = web-client"]
+    B --> C{"Allowed: openid profile email<br/>✓ all match"}
+    C --> D["Scopes granted:<br/>openid, profile, email"]
+    D --> E["Token issued<br/>with scopes embedded"]
+    D --> F["/userinfo response<br/>filtered by token scopes"]
+    F --> G["openid → sub"]
+    F --> H["profile → name"]
+    F --> I["email → email"]
 
-  If scope not allowed for client:
-    Request: scope=openid email   (client="workspace", allowed: openid profile)
-                     │
-                     ▼
-           400 { "error": "invalid_scope" }
+    J["Request: scope=openid email<br/>client=workspace, allowed: openid profile"] --> K["400 {error: invalid_scope}"]
 ```
 
 ### Discovery Endpoint
 
-```
-  GET /.well-known/openid-configuration
-                    │
-                    ▼
-  ┌──────────────────────────────────────────────────────┐
-  │ {                                                    │
-  │   "issuer": "http://localhost:8080",                 │
-  │   "authorization_endpoint": ".../authorize",         │
-  │   "token_endpoint": ".../token",                     │
-  │   "userinfo_endpoint": ".../userinfo",               │
-  │   "end_session_endpoint": ".../logout",              │
-  │   "response_types_supported": ["code"],              │
-  │   "grant_types_supported": [                         │
-  │     "authorization_code", "refresh_token"            │
-  │   ],                                                 │
-  │   "scopes_supported": ["openid","profile","email"],  │
-  │   "code_challenge_methods_supported": ["S256"],      │
-  │   "token_endpoint_auth_methods_supported": ["none"]  │
-  │ }                                                    │
-  └──────────────────────────────────────────────────────┘
+`GET /.well-known/openid-configuration` returns:
 
-  Clients can auto-discover all endpoints and capabilities
-  instead of hardcoding URLs.
+```json
+{
+  "issuer": "http://localhost:8080",
+  "authorization_endpoint": ".../authorize",
+  "token_endpoint": ".../token",
+  "userinfo_endpoint": ".../userinfo",
+  "end_session_endpoint": ".../logout",
+  "response_types_supported": ["code"],
+  "grant_types_supported": ["authorization_code", "refresh_token"],
+  "scopes_supported": ["openid", "profile", "email"],
+  "code_challenge_methods_supported": ["S256"],
+  "token_endpoint_auth_methods_supported": ["none"]
+}
 ```
+
+Clients can auto-discover all endpoints and capabilities instead of hardcoding URLs.
 
 ### Logout Flow
 
-```
-Client ──► GET /logout?redirect_uri=... ──► OAuth Server
-                                               │
-                                     Expires session cookie
-                                               │
-                                     302 redirect to redirect_uri
-                                               │
-Client (login form) ◄─────────────────────────┘
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant S as OAuth Server
+
+    C->>S: GET /logout?redirect_uri=...
+    Note right of S: Expires session cookie
+    S->>C: 302 redirect to redirect_uri
+    Note over C: Back to login form
 ```
 
 ## Project Structure
