@@ -1,0 +1,100 @@
+# OAuth Server + VSCode Extension Example
+
+Minimal OAuth 2.0 Authorization Code with PKCE flow: a Go server and a VSCode extension client.
+
+## Architecture
+
+```
+┌──────────────────┐         ┌──────────────────┐         ┌──────────────────┐
+│  VSCode Extension│         │     Browser       │         │   Go OAuth Server│
+│  (localhost:3000)│         │                   │         │   (localhost:8080)│
+└────────┬─────────┘         └────────┬──────────┘         └────────┬─────────┘
+         │                            │                             │
+         │  1. Generate PKCE pair     │                             │
+         │     (code_verifier +       │                             │
+         │      code_challenge)       │                             │
+         │                            │                             │
+         │  2. Open browser ──────────┼──► GET /authorize           │
+         │     with code_challenge    │     ?client_id=...          │
+         │     + state                │     &code_challenge=...     │
+         │                            │     &state=...              │
+         │                            │                             │
+         │                            │  3. User logs in ──────────►│
+         │                            │     (demo / demo)           │
+         │                            │                             │
+         │                            │  4. Server redirects ◄──────│
+         │                            │     to localhost:3000       │
+         │                            │     with ?code=...&state=...│
+         │                            │                             │
+         │  5. Callback server ◄──────┤                             │
+         │     captures auth code     │                             │
+         │                            │                             │
+         │  6. POST /token ─────────────────────────────────────────►
+         │     with code + code_verifier                            │
+         │                                                          │
+         │  7. Server verifies PKCE ◄───────────────────────────────│
+         │     returns access_token                                 │
+         │                                                          │
+         │  8. GET /userinfo ───────────────────────────────────────►
+         │     Authorization: Bearer <token>                        │
+         │                                                          │
+         │  9. Returns user data ◄──────────────────────────────────│
+         └──────────────────────────────────────────────────────────┘
+```
+
+## Project Structure
+
+```
+oauth-server/          Go OAuth 2.0 authorization server
+├── main.go            Server with /authorize, /token, /userinfo endpoints
+└── go.mod
+
+vscode-extension/      VSCode extension (TypeScript)
+├── src/
+│   ├── extension.ts       Commands: Sign In, Sign Out, Get User Info
+│   └── authProvider.ts    AuthenticationProvider with PKCE flow
+├── package.json
+└── tsconfig.json
+```
+
+## Server Endpoints
+
+| Method | Path         | Description                                  |
+|--------|-------------|----------------------------------------------|
+| GET    | `/authorize` | Shows login form, issues authorization code  |
+| POST   | `/token`     | Exchanges auth code for access token (PKCE)  |
+| GET    | `/userinfo`  | Returns user info (requires Bearer token)    |
+
+## Quick Start
+
+### 1. Start the OAuth server
+
+```bash
+cd oauth-server
+go run .
+```
+
+Server runs on `http://localhost:8080`.
+
+### 2. Launch the VSCode extension
+
+```bash
+cd vscode-extension
+npm install
+npm run compile
+code --extensionDevelopmentPath=$(pwd)
+```
+
+### 3. Authenticate
+
+1. Open Command Palette (`Cmd+Shift+P`)
+2. Run **OAuth Demo: Sign In**
+3. Browser opens → log in with `demo` / `demo`
+4. Redirects back → extension receives token
+5. Run **OAuth Demo: Get User Info** to verify
+
+## Demo Credentials
+
+| Username | Password |
+|----------|----------|
+| `demo`   | `demo`   |

@@ -1,0 +1,38 @@
+{
+  "name": "oauth-demo",
+  "displayName": "OAuth Demo",
+  "description": "Demo VSCode extension with OAuth authentication",
+  "version": "0.0.1",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": ["Other"],
+  "activationEvents": [],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "oauthDemo.signIn",
+        "title": "OAuth Demo: Sign In"
+      },
+      {
+        "command": "oauthDemo.signOut",
+        "title": "OAuth Demo: Sign Out"
+      },
+      {
+        "command": "oauthDemo.getUserInfo",
+        "title": "OAuth Demo: Get User Info"
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.80.0",
+    "typescript": "^5.3.0"
+  }
+}
