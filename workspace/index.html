@@ -131,7 +131,7 @@
 
     function signOut() {
       sessionStorage.removeItem('access_token');
-      window.location.href = 'http://localhost:8080/authorize';
+      window.location.href = `http://localhost:8080/logout?redirect_uri=${encodeURIComponent(REDIRECT_URI)}`;
     }
 
     function showError(msg) {

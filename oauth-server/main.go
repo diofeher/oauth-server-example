@@ -359,16 +359,34 @@ func corsMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+func handleLogout(w http.ResponseWriter, r *http.Request) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     "session_id",
+		Value:    "",
+		Path:     "/",
+		HttpOnly: true,
+		MaxAge:   -1,
+	})
+
+	redirectTo := r.URL.Query().Get("redirect_uri")
+	if redirectTo == "" {
+		redirectTo = "/authorize"
+	}
+	http.Redirect(w, r, redirectTo, http.StatusFound)
+}
+
 func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/authorize", handleAuthorize)
 	mux.HandleFunc("/token", handleToken)
 	mux.HandleFunc("/userinfo", handleUserInfo)
+	mux.HandleFunc("/logout", handleLogout)
 
 	fmt.Printf("OAuth server running on http://localhost%s\n", listenAddr)
 	fmt.Println("Endpoints:")
 	fmt.Println("  GET  /authorize  — authorization + SSO endpoint")
 	fmt.Println("  POST /token      — token endpoint")
 	fmt.Println("  GET  /userinfo   — protected resource")
+	fmt.Println("  GET  /logout     — clear session + redirect")
 	log.Fatal(http.ListenAndServe(listenAddr, corsMiddleware(mux)))
 }

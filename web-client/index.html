@@ -128,8 +128,7 @@
 
     function signOut() {
       sessionStorage.removeItem('access_token');
-      showSignedOut();
-      showStatus('Signed out.');
+      window.location.href = `http://localhost:8080/logout?redirect_uri=${encodeURIComponent(REDIRECT_URI)}`;
     }
 
     function showSignedIn() {
