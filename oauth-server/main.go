@@ -20,6 +20,7 @@ const listenAddr = ":8080"
 var validClients = map[string]bool{
 	"vscode-extension": true,
 	"web-client":       true,
+	"workspace":        true,
 }
 
 type AuthCode struct {
@@ -37,16 +38,24 @@ type Token struct {
 	ExpiresAt   time.Time
 }
 
+type Session struct {
+	ID        string
+	UserID    string
+	ExpiresAt time.Time
+}
+
 type Store struct {
-	mu     sync.RWMutex
-	codes  map[string]*AuthCode
-	tokens map[string]*Token
+	mu       sync.RWMutex
+	codes    map[string]*AuthCode
+	tokens   map[string]*Token
+	sessions map[string]*Session
 }
 
 func NewStore() *Store {
 	return &Store{
-		codes:  make(map[string]*AuthCode),
-		tokens: make(map[string]*Token),
+		codes:    make(map[string]*AuthCode),
+		tokens:   make(map[string]*Token),
+		sessions: make(map[string]*Session),
 	}
 }
 
@@ -79,6 +88,22 @@ func (s *Store) GetToken(accessToken string) *Token {
 	return s.tokens[accessToken]
 }
 
+func (s *Store) SaveSession(sess *Session) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sessions[sess.ID] = sess
+}
+
+func (s *Store) GetSession(id string) *Session {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	sess, ok := s.sessions[id]
+	if !ok || time.Now().After(sess.ExpiresAt) {
+		return nil
+	}
+	return sess
+}
+
 var store = NewStore()
 
 func randomString(n int) string {
@@ -94,6 +119,53 @@ func verifyPKCE(codeVerifier, codeChallenge, method string) bool {
 	h := sha256.Sum256([]byte(codeVerifier))
 	computed := base64.RawURLEncoding.EncodeToString(h[:])
 	return computed == codeChallenge
+}
+
+func getSessionUser(r *http.Request) string {
+	cookie, err := r.Cookie("session_id")
+	if err != nil {
+		return ""
+	}
+	sess := store.GetSession(cookie.Value)
+	if sess == nil {
+		return ""
+	}
+	return sess.UserID
+}
+
+func setSessionCookie(w http.ResponseWriter, userID string) {
+	sess := &Session{
+		ID:        randomString(32),
+		UserID:    userID,
+		ExpiresAt: time.Now().Add(24 * time.Hour),
+	}
+	store.SaveSession(sess)
+	http.SetCookie(w, &http.Cookie{
+		Name:     "session_id",
+		Value:    sess.ID,
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   86400,
+	})
+}
+
+func issueCodeAndRedirect(w http.ResponseWriter, r *http.Request, userID, redirectURI, state, codeChallenge, codeChallengeMethod string) {
+	code := randomString(32)
+	store.SaveCode(&AuthCode{
+		Code:                code,
+		CodeChallenge:       codeChallenge,
+		CodeChallengeMethod: codeChallengeMethod,
+		RedirectURI:         redirectURI,
+		UserID:              userID,
+		ExpiresAt:           time.Now().Add(10 * time.Minute),
+	})
+
+	sep := "?"
+	if strings.Contains(redirectURI, "?") {
+		sep = "&"
+	}
+	http.Redirect(w, r, fmt.Sprintf("%s%scode=%s&state=%s", redirectURI, sep, code, state), http.StatusFound)
 }
 
 var loginTmpl = template.Must(template.New("login").Parse(`<!DOCTYPE html>
@@ -120,20 +192,53 @@ button { background: #0066cc; color: white; border: none; cursor: pointer; borde
 <p style="color:#888; font-size:12px;">Demo credentials: demo / demo</p>
 </body></html>`))
 
+var dashboardTmpl = template.Must(template.New("dashboard").Parse(`<!DOCTYPE html>
+<html><head><title>Dashboard</title>
+<style>
+body { font-family: system-ui; max-width: 480px; margin: 80px auto; }
+a { display: inline-block; padding: 10px 20px; background: #228833; color: white; text-decoration: none; border-radius: 6px; margin-top: 16px; }
+</style></head>
+<body>
+<h2>Welcome, {{.UserID}}</h2>
+<p>You are signed in.</p>
+<a href="http://localhost:5501">Launch Workspace</a>
+</body></html>`))
+
 func handleAuthorize(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet {
+		clientID := r.URL.Query().Get("client_id")
+		redirectURI := r.URL.Query().Get("redirect_uri")
+		state := r.URL.Query().Get("state")
+		codeChallenge := r.URL.Query().Get("code_challenge")
+		codeChallengeMethod := r.URL.Query().Get("code_challenge_method")
+
+		// SSO: if user has valid session, skip login and auto-issue code
+		if userID := getSessionUser(r); userID != "" && clientID != "" && redirectURI != "" {
+			issueCodeAndRedirect(w, r, userID, redirectURI, state, codeChallenge, codeChallengeMethod)
+			return
+		}
+
+		// No OAuth params — show dashboard if logged in
+		if userID := getSessionUser(r); userID != "" && clientID == "" {
+			dashboardTmpl.Execute(w, map[string]string{"UserID": userID})
+			return
+		}
+
 		data := map[string]string{
-			"ClientID":            r.URL.Query().Get("client_id"),
-			"RedirectURI":        r.URL.Query().Get("redirect_uri"),
-			"State":              r.URL.Query().Get("state"),
-			"CodeChallenge":      r.URL.Query().Get("code_challenge"),
-			"CodeChallengeMethod": r.URL.Query().Get("code_challenge_method"),
+			"ClientID":            clientID,
+			"RedirectURI":         redirectURI,
+			"State":               state,
+			"CodeChallenge":       codeChallenge,
+			"CodeChallengeMethod": codeChallengeMethod,
 		}
 		loginTmpl.Execute(w, data)
 		return
 	}
 
-	r.ParseForm()
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
 
 	username := r.FormValue("username")
 	password := r.FormValue("password")
@@ -142,24 +247,18 @@ func handleAuthorize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	setSessionCookie(w, username)
+
 	redirectURI := r.FormValue("redirect_uri")
 	state := r.FormValue("state")
 
-	code := randomString(32)
-	store.SaveCode(&AuthCode{
-		Code:                code,
-		CodeChallenge:       r.FormValue("code_challenge"),
-		CodeChallengeMethod: r.FormValue("code_challenge_method"),
-		RedirectURI:         redirectURI,
-		UserID:              username,
-		ExpiresAt:           time.Now().Add(10 * time.Minute),
-	})
-
-	sep := "?"
-	if strings.Contains(redirectURI, "?") {
-		sep = "&"
+	if redirectURI == "" {
+		dashboardTmpl.Execute(w, map[string]string{"UserID": username})
+		return
 	}
-	http.Redirect(w, r, fmt.Sprintf("%s%scode=%s&state=%s", redirectURI, sep, code, state), http.StatusFound)
+
+	issueCodeAndRedirect(w, r, username, redirectURI, state,
+		r.FormValue("code_challenge"), r.FormValue("code_challenge_method"))
 }
 
 func handleToken(w http.ResponseWriter, r *http.Request) {
@@ -168,7 +267,10 @@ func handleToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	r.ParseForm()
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
 
 	grantType := r.FormValue("grant_type")
 	if grantType != "authorization_code" {
@@ -265,7 +367,7 @@ func main() {
 
 	fmt.Printf("OAuth server running on http://localhost%s\n", listenAddr)
 	fmt.Println("Endpoints:")
-	fmt.Println("  GET  /authorize  — authorization endpoint (shows login)")
+	fmt.Println("  GET  /authorize  — authorization + SSO endpoint")
 	fmt.Println("  POST /token      — token endpoint")
 	fmt.Println("  GET  /userinfo   — protected resource")
 	log.Fatal(http.ListenAndServe(listenAddr, corsMiddleware(mux)))
